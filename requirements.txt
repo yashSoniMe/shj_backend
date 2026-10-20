@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+motor
+pyjwt
+bcrypt
+pydantic

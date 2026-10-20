@@ -6,8 +6,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from motor.motor_asyncio import AsyncIOMotorClient
 import bcrypt, jwt
-from dotenv import load_dotenv
-load_dotenv()
+# from dotenv import load_dotenv
+# load_dotenv()
 
 db = AsyncIOMotorClient(os.environ["MONGO_URI"])[os.getenv("DB_NAME", "jewellery")]
 SECRET = os.environ["JWT_SECRET"]

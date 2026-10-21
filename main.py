@@ -48,7 +48,22 @@ class SipTx(BaseModel):
     date: dt.date = None; amount: float = 0          # deposit amount
     amount_deducted: float = 0; grams: float = 0     # deduction / delivery
     note: str = ""
+# ---------- change pwd ----------
+class ChangePw(BaseModel):
+    old_password: str
+    new_password: str
 
+@app.post("/me/change-password")
+async def change_password(b: ChangePw, u=Depends(customer)):
+    if not bcrypt.checkpw(b.old_password.encode(), u["pwd"]):
+        raise HTTPException(400, "Current password is incorrect")
+    if len(b.new_password) < 6:
+        raise HTTPException(400, "New password must be at least 6 characters")
+    if b.new_password == b.old_password:
+        raise HTTPException(400, "New password must be different from the current one")
+    await db.customers.update_one({"phone": u["phone"]},
+        {"$set": {"pwd": bcrypt.hashpw(b.new_password.encode(), bcrypt.gensalt())}})
+    return {"ok": True}
 # ---------- auth ----------
 @app.post("/auth/login")
 async def login(b: Login):

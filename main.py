@@ -1,4 +1,4 @@
-import os, uuid, calendar, datetime as dt
+import os, re, uuid, calendar, datetime as dt
 from typing import Optional, Literal
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -35,6 +35,25 @@ def add_months(d: dt.date, n: int):
     m = d.month - 1 + n; y = d.year + m // 12; m = m % 12 + 1
     return dt.date(y, m, min(d.day, calendar.monthrange(y, m)[1]))
 
+# ---------- activity log ----------
+def inr(v): return f"₹{v:,.0f}" if float(v) == int(v) else f"₹{v:,.2f}"
+def dmy(d):
+    if isinstance(d, str): d = dt.date.fromisoformat(d)
+    return d.strftime("%d/%m/%Y")
+
+async def log(action, desc, phone=None, name=None, actor="admin"):
+    """Never lets a logging problem break the real action."""
+    try:
+        await db.logs.insert_one({"ts": dt.datetime.utcnow(), "action": action,
+            "category": action.split("_")[0], "desc": desc, "phone": phone, "name": name, "actor": actor})
+    except Exception as e:
+        print("log failed:", e)
+
+@app.on_event("startup")
+async def make_indexes():
+    try: await db.logs.create_index([("ts", -1)])
+    except Exception as e: print("index failed:", e)
+
 class Login(BaseModel): phone: str; password: str
 class CustomerIn(BaseModel): name: str; phone: str; password: str
 class BachatIn(BaseModel):
@@ -48,57 +67,12 @@ class SipTx(BaseModel):
     date: dt.date = None; amount: float = 0          # deposit amount
     amount_deducted: float = 0; grams: float = 0     # deduction / delivery
     note: str = ""
-#-----------
 class CustomerEdit(BaseModel):
     name: str
     phone: str
-
-@app.post("/admin/customers/{phone}/update", dependencies=[Depends(admin)])
-async def update_customer(phone: str, b: CustomerEdit):
-    await get_cust(phone)
-    name, new_phone = b.name.strip(), b.phone.strip()
-    if not name or not new_phone:
-        raise HTTPException(400, "Name and phone are required")
-    if new_phone != phone and await db.customers.find_one({"phone": new_phone}):
-        raise HTTPException(409, "Another customer already uses this phone number")
-    await db.customers.update_one({"phone": phone}, {"$set": {"name": name, "phone": new_phone}})
-    return {"ok": True}
-
-@app.post("/admin/customers/{phone}/delete", dependencies=[Depends(admin)])
-async def delete_customer(phone: str):
-    r = await db.customers.delete_one({"phone": phone})
-    if r.deleted_count == 0:
-        raise HTTPException(404, "Customer not found")
-    return {"ok": True}
-# ---------- change pwd ----------
 class ChangePw(BaseModel):
     old_password: str
     new_password: str
-
-@app.post("/me/change-password")
-async def change_password(b: ChangePw, u=Depends(customer)):
-    if not bcrypt.checkpw(b.old_password.encode(), u["pwd"]):
-        raise HTTPException(400, "Current password is incorrect")
-    if len(b.new_password) < 6:
-        raise HTTPException(400, "New password must be at least 6 characters")
-    if b.new_password == b.old_password:
-        raise HTTPException(400, "New password must be different from the current one")
-    await db.customers.update_one({"phone": u["phone"]},
-        {"$set": {"pwd": bcrypt.hashpw(b.new_password.encode(), bcrypt.gensalt())}})
-    return {"ok": True}
-# ---------- auth ----------
-@app.post("/auth/login")
-async def login(b: Login):
-    u = await db.customers.find_one({"phone": b.phone, "active": True})
-    if not u or not bcrypt.checkpw(b.password.encode(), u["pwd"]):
-        raise HTTPException(401, "Invalid phone or password")
-    return {"token": make_token(b.phone, "customer"), "name": u["name"], "phone": u["phone"]}
-
-@app.post("/admin/login")
-async def admin_login(b: Login):
-    if b.phone != os.environ["ADMIN_USER"] or b.password != os.environ["ADMIN_PASS"]:
-        raise HTTPException(401, "Invalid admin credentials")
-    return {"token": make_token("admin", "admin")}
 
 # ---------- helpers ----------
 def new_id(prefix): return prefix + uuid.uuid4().hex[:6].upper()
@@ -107,6 +81,11 @@ def pick(u, key, aid):
     for a in u.get(key) or []:
         if a["id"] == aid: return a
     raise HTTPException(404, "Account not found")
+
+async def get_cust(phone):
+    u = await db.customers.find_one({"phone": phone})
+    if not u: raise HTTPException(404, "Customer not found")
+    return u
 
 def bachat_view(b):
     start = dt.date.fromisoformat(b["start_date"])
@@ -139,6 +118,22 @@ def sip_view(s):
         "total_deducted": ded, "cash_balance": dep - ded, "gold_grams": grams,
         "transactions": sorted(s["txs"], key=lambda t: t["date"], reverse=True)}
 
+# ---------- auth ----------
+@app.post("/auth/login")
+async def login(b: Login):
+    u = await db.customers.find_one({"phone": b.phone, "active": True})
+    if not u or not bcrypt.checkpw(b.password.encode(), u["pwd"]):
+        raise HTTPException(401, "Invalid phone or password")
+    return {"token": make_token(b.phone, "customer"), "name": u["name"], "phone": u["phone"]}
+
+@app.post("/admin/login")
+async def admin_login(b: Login):
+    if b.phone != os.environ["ADMIN_USER"] or b.password != os.environ["ADMIN_PASS"]:
+        await log("security_login_failed", f"Failed admin login attempt (username: {b.phone[:30]})")
+        raise HTTPException(401, "Invalid admin credentials")
+    await log("security_admin_login", "Admin logged in")
+    return {"token": make_token("admin", "admin")}
+
 # ---------- customer endpoints ----------
 @app.get("/me")
 async def me(u=Depends(customer)):
@@ -153,17 +148,26 @@ async def my_bachat(u=Depends(customer)):
 async def my_sip(u=Depends(customer)):
     return {"accounts": [sip_view(s) for s in u.get("sip") or []]}
 
-# ---------- admin endpoints (for the admin website) ----------
-async def get_cust(phone):
-    u = await db.customers.find_one({"phone": phone})
-    if not u: raise HTTPException(404, "Customer not found")
-    return u
+@app.post("/me/change-password")
+async def change_password(b: ChangePw, u=Depends(customer)):
+    if not bcrypt.checkpw(b.old_password.encode(), u["pwd"]):
+        raise HTTPException(400, "Current password is incorrect")
+    if len(b.new_password) < 6:
+        raise HTTPException(400, "New password must be at least 6 characters")
+    if b.new_password == b.old_password:
+        raise HTTPException(400, "New password must be different from the current one")
+    await db.customers.update_one({"phone": u["phone"]},
+        {"$set": {"pwd": bcrypt.hashpw(b.new_password.encode(), bcrypt.gensalt())}})
+    await log("security_password_change", f"{u['name']} changed their own password", u["phone"], u["name"], actor="customer")
+    return {"ok": True}
 
+# ---------- admin: customers ----------
 @app.post("/admin/customers", dependencies=[Depends(admin)])
 async def add_customer(b: CustomerIn):
     if await db.customers.find_one({"phone": b.phone}): raise HTTPException(409, "Phone exists")
     await db.customers.insert_one({"name": b.name, "phone": b.phone, "active": True,
         "pwd": bcrypt.hashpw(b.password.encode(), bcrypt.gensalt()), "bachat": [], "sip": []})
+    await log("customer_add", f"Added customer {b.name} ({b.phone})", b.phone, b.name)
     return {"ok": True}
 
 @app.get("/admin/customers", dependencies=[Depends(admin)])
@@ -179,20 +183,47 @@ async def customer_detail(phone: str):
             "bachat": [bachat_view(b) for b in u.get("bachat") or []],
             "sip": [sip_view(s) for s in u.get("sip") or []]}
 
-@app.post("/admin/customers/{phone}/reset-password", dependencies=[Depends(admin)])
-async def reset_pw(phone: str, b: Login):
-    await get_cust(phone)
-    await db.customers.update_one({"phone": phone},
-        {"$set": {"pwd": bcrypt.hashpw(b.password.encode(), bcrypt.gensalt())}})
+@app.post("/admin/customers/{phone}/update", dependencies=[Depends(admin)])
+async def update_customer(phone: str, b: CustomerEdit):
+    u = await get_cust(phone)
+    name, new_phone = b.name.strip(), b.phone.strip()
+    if not name or not new_phone:
+        raise HTTPException(400, "Name and phone are required")
+    if new_phone != phone and await db.customers.find_one({"phone": new_phone}):
+        raise HTTPException(409, "Another customer already uses this phone number")
+    await db.customers.update_one({"phone": phone}, {"$set": {"name": name, "phone": new_phone}})
+    changes = []
+    if name != u["name"]: changes.append(f"name '{u['name']}' → '{name}'")
+    if new_phone != phone: changes.append(f"phone {phone} → {new_phone}")
+    if changes:
+        await log("customer_edit", f"Edited {u['name']}: " + ", ".join(changes), new_phone, name)
     return {"ok": True}
 
+@app.post("/admin/customers/{phone}/delete", dependencies=[Depends(admin)])
+async def delete_customer(phone: str):
+    u = await get_cust(phone)
+    await db.customers.delete_one({"phone": phone})
+    nb, ns = len(u.get("bachat") or []), len(u.get("sip") or [])
+    await log("customer_delete", f"Deleted customer {u['name']} ({phone}) with {nb} Bachat and {ns} SIP account(s)", phone, u["name"])
+    return {"ok": True}
+
+@app.post("/admin/customers/{phone}/reset-password", dependencies=[Depends(admin)])
+async def reset_pw(phone: str, b: Login):
+    u = await get_cust(phone)
+    await db.customers.update_one({"phone": phone},
+        {"$set": {"pwd": bcrypt.hashpw(b.password.encode(), bcrypt.gensalt())}})
+    await log("security_password_reset", f"Reset login password for {u['name']}", phone, u["name"])
+    return {"ok": True}
+
+# ---------- admin: Suvarna Bachat Yojna ----------
 @app.post("/admin/bachat/enroll", dependencies=[Depends(admin)])
 async def bachat_enroll(b: BachatIn):
-    await get_cust(b.phone)
+    u = await get_cust(b.phone)
     if b.months < 2 or b.emi <= 0: raise HTTPException(400, "Invalid EMI/months")
     acc = {"id": new_id("BY"), "emi": b.emi, "months": b.months,
            "start_date": b.start_date.isoformat(), "payments": []}
     await db.customers.update_one({"phone": b.phone}, {"$push": {"bachat": acc}})
+    await log("bachat_enroll", f"Opened Bachat account {acc['id']} for {u['name']}: {inr(b.emi)} × {b.months} months, starting {dmy(b.start_date)}", b.phone, u["name"])
     return {"ok": True, "account_id": acc["id"]}
 
 @app.post("/admin/bachat/payment", dependencies=[Depends(admin)])
@@ -200,17 +231,22 @@ async def bachat_pay(b: PayIn):
     u = await get_cust(b.phone); bc = pick(u, "bachat", b.account_id)
     if not 1 <= b.month_no < bc["months"]: raise HTTPException(400, "Invalid month (last month is bonus)")
     if any(p["month_no"] == b.month_no for p in bc["payments"]): raise HTTPException(409, "Already paid")
+    paid_on = b.date or dt.date.today()
     rec = {"month_no": b.month_no, "amount": b.amount or bc["emi"],
-           "date": (b.date or dt.date.today()).isoformat(), "mode": b.mode, "note": b.note}
+           "date": paid_on.isoformat(), "mode": b.mode, "note": b.note}
     await db.customers.update_one({"phone": b.phone, "bachat.id": b.account_id},
                                   {"$push": {"bachat.$.payments": rec}})
+    month = add_months(dt.date.fromisoformat(bc["start_date"]), b.month_no - 1).strftime("%b %Y")
+    await log("bachat_payment", f"Received {inr(rec['amount'])} from {u['name']} for {month} EMI ({b.account_id}) via {b.mode} on {dmy(paid_on)}", b.phone, u["name"])
     return {"ok": True}
 
+# ---------- admin: Gold SIP ----------
 @app.post("/admin/sip/enroll", dependencies=[Depends(admin)])
 async def sip_enroll(b: SipJoin):
-    await get_cust(b.phone)
+    u = await get_cust(b.phone)
     acc = {"id": new_id("SP"), "start_date": b.start_date.isoformat(), "txs": []}
     await db.customers.update_one({"phone": b.phone}, {"$push": {"sip": acc}})
+    await log("sip_enroll", f"Opened Gold SIP account {acc['id']} for {u['name']}, starting {dmy(b.start_date)}", b.phone, u["name"])
     return {"ok": True, "account_id": acc["id"]}
 
 @app.post("/admin/sip/transaction", dependencies=[Depends(admin)])
@@ -223,8 +259,31 @@ async def sip_tx(b: SipTx):
         if b.amount_deducted > dep - ded: raise HTTPException(400, "Insufficient balance")
     if b.type == "delivery" and (b.grams <= 0 or b.grams > grams):
         raise HTTPException(400, "Invalid grams (exceeds gold in account)")
-    rec = {"type": b.type, "date": (b.date or dt.date.today()).isoformat(), "amount": b.amount,
+    on = b.date or dt.date.today()
+    rec = {"type": b.type, "date": on.isoformat(), "amount": b.amount,
            "amount_deducted": b.amount_deducted, "grams": b.grams, "note": b.note}
     await db.customers.update_one({"phone": b.phone, "sip.id": b.account_id},
                                   {"$push": {"sip.$.txs": rec}})
+    if b.type == "deposit":
+        desc = f"Received SIP deposit of {inr(b.amount)} from {u['name']} ({b.account_id}) on {dmy(on)}"
+    elif b.type == "deduction":
+        desc = f"Deducted {inr(b.amount_deducted)} from {u['name']}'s SIP ({b.account_id}) and added {b.grams} gm gold on {dmy(on)}"
+    else:
+        desc = f"Delivered {b.grams} gm gold to {u['name']} from SIP ({b.account_id}) on {dmy(on)}"
+    await log(f"sip_{b.type}", desc, b.phone, u["name"])
     return {"ok": True}
+
+# ---------- admin: activity logs ----------
+@app.get("/admin/logs", dependencies=[Depends(admin)])
+async def get_logs(category: Optional[str] = None, q: Optional[str] = None, limit: int = 40, skip: int = 0):
+    f = {}
+    if category and category != "all": f["category"] = category
+    if q:
+        rx = {"$regex": re.escape(q.strip()), "$options": "i"}
+        f["$or"] = [{"name": rx}, {"phone": rx}, {"desc": rx}]
+    limit = max(1, min(limit, 100))
+    rows = [r async for r in db.logs.find(f).sort("ts", -1).skip(max(skip, 0)).limit(limit + 1)]
+    more = len(rows) > limit
+    return {"more": more, "logs": [{"id": str(r["_id"]), "ts": r["ts"].isoformat() + "Z", "action": r["action"],
+        "category": r["category"], "desc": r["desc"], "phone": r.get("phone"), "name": r.get("name"),
+        "actor": r.get("actor", "admin")} for r in rows[:limit]]}

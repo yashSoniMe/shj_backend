@@ -48,6 +48,28 @@ class SipTx(BaseModel):
     date: dt.date = None; amount: float = 0          # deposit amount
     amount_deducted: float = 0; grams: float = 0     # deduction / delivery
     note: str = ""
+#-----------
+class CustomerEdit(BaseModel):
+    name: str
+    phone: str
+
+@app.post("/admin/customers/{phone}/update", dependencies=[Depends(admin)])
+async def update_customer(phone: str, b: CustomerEdit):
+    await get_cust(phone)
+    name, new_phone = b.name.strip(), b.phone.strip()
+    if not name or not new_phone:
+        raise HTTPException(400, "Name and phone are required")
+    if new_phone != phone and await db.customers.find_one({"phone": new_phone}):
+        raise HTTPException(409, "Another customer already uses this phone number")
+    await db.customers.update_one({"phone": phone}, {"$set": {"name": name, "phone": new_phone}})
+    return {"ok": True}
+
+@app.post("/admin/customers/{phone}/delete", dependencies=[Depends(admin)])
+async def delete_customer(phone: str):
+    r = await db.customers.delete_one({"phone": phone})
+    if r.deleted_count == 0:
+        raise HTTPException(404, "Customer not found")
+    return {"ok": True}
 # ---------- change pwd ----------
 class ChangePw(BaseModel):
     old_password: str
